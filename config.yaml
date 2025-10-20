@@ -1,0 +1,73 @@
+server:
+  name: "IT Trends MCP Server"
+  version: "1.0.0"
+  host: "localhost"
+  port: 8080
+
+data_sources:
+  reddit:
+    client_id: "${REDDIT_CLIENT_ID}"
+    client_secret: "${REDDIT_CLIENT_SECRET}"
+    user_agent: "ITTrendsAnalyzer/1.0"
+    subreddits:
+      - "programming"
+      - "webdev"
+      - "technology"
+      - "freelance"
+      - "startups"
+      - "entrepreneur"
+  
+  freelance:
+    platforms:
+      - name: "upwork"
+        enabled: true
+        rate_limit: 10  # requests per minute
+      - name: "freelancer"
+        enabled: true
+        rate_limit: 10
+      - name: "fiverr"
+        enabled: false
+  
+  trends:
+    google_trends:
+      enabled: true
+      region: "US"
+    github:
+      enabled: true
+      token: "${GITHUB_TOKEN}"
+    stackoverflow:
+      enabled: true
+      key: "${STACKOVERFLOW_KEY}"
+
+analysis:
+  lookback_days: 7
+  min_mentions: 5
+  top_n_results: 20
+  languages: ["en", "ru"]
+  technology_keywords:
+    - "python"
+    - "javascript"
+    - "react"
+    - "docker"
+    - "kubernetes"
+    - "go"
+    - "java"
+    - "typescript"
+    - "rust"
+
+cache:
+  enabled: true
+  ttl: 3600  # seconds
+  storage: "file"  # or "redis"
+  redis_url: "${REDIS_URL}"
+
+database:
+  type: "sqlite"  # or "postgresql"
+  path: "./data/trends.db"
+  connection_string: "${DATABASE_URL}"
+
+reporting:
+  output_dir: "./reports"
+  default_format: "pdf"
+  include_charts: true
+  chart_style: "seaborn"

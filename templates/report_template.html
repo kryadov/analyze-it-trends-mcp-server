@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ title }}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #222; }
+    h1, h2 { color: #1f3b57; }
+    .meta { color: #666; font-size: 12px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+    th, td { border: 1px solid #ddd; padding: 8px; }
+    th { background: #f4f6f8; text-align: left; }
+    .chart { margin-top: 24px; }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+    .pos { background: #e8f5e9; color: #2e7d32; }
+    .neg { background: #ffebee; color: #c62828; }
+    .neu { background: #eceff1; color: #455a64; }
+  </style>
+</head>
+<body>
+  <h1>IT Trends Report</h1>
+  <div class="meta">Generated at: {{ generated_at }}</div>
+
+  <h2>Top Technologies</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Technology</th>
+        <th>Mentions</th>
+        <th>Sentiment</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for item in data.top_technologies %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{{ item.technology }}</td>
+        <td>{{ item.mentions }}</td>
+        {% set s = data.sentiment[item.technology] if data.sentiment and item.technology in data.sentiment else None %}
+        <td>
+          {% if s %}
+            {% set val = s.avg_sentiment %}
+            {% if val > 0.2 %}
+              <span class="badge pos">positive ({{ '%.2f' % val }})</span>
+            {% elif val < -0.2 %}
+              <span class="badge neg">negative ({{ '%.2f' % val }})</span>
+            {% else %}
+              <span class="badge neu">neutral ({{ '%.2f' % val }})</span>
+            {% endif %}
+          {% else %}
+            <span class="badge neu">n/a</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  {% if charts.top_mentions %}
+  <div class="chart">
+    <h2>Chart: Top Mentions</h2>
+    <img src="{{ charts.top_mentions }}" alt="Top mentions chart" style="max-width: 100%; height: auto;" />
+  </div>
+  {% endif %}
+
+</body>
+</html>
