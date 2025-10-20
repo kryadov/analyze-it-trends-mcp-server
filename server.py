@@ -239,5 +239,12 @@ async def get_historical_comparison(technology: str, days_back: int = 30) -> Dic
 
 
 if __name__ == "__main__":
+    # Log startup to stderr (safe for MCP stdio) so users see confirmation on launch
+    try:
+        pid = os.getpid()
+    except Exception:
+        pid = None
+    logger.info("MCP server successfully started | name=%s version=%s transport=stdio pid=%s", server_meta.get("name"), server_meta.get("version"), pid)
+
     # Run MCP server (stdio by default)
     server.run()
