@@ -2,9 +2,12 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from threading import Thread
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from dotenv import load_dotenv
 import yaml
@@ -12,8 +15,13 @@ import yaml
 try:
     # FastMCP is a high-level helper for building MCP servers easily
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.server import Context
 except Exception:  # pragma: no cover - fallback if fastmcp path changes
     from mcp import FastMCP  # type: ignore
+    try:
+        from mcp.server.fastmcp.server import Context  # type: ignore
+    except Exception:  # pragma: no cover - last resort
+        Context = Any  # type: ignore
 
 # Local modules
 from tools.reddit_analyzer import RedditAnalyzer
@@ -44,6 +52,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("it-trends-mcp-server")
+START_TIME = time.time()
 
 
 def load_config(path: Path) -> Dict[str, Any]:
@@ -98,6 +107,7 @@ def read_cached_trends(date: str) -> bytes:
 
     Example URI: cache://trends/2025-10-21
     """
+    logger.info("resource access: cache://trends/%s", date)
     key = f"trends:{date}"
     data = cache.get(key)
     if data is None:
@@ -110,6 +120,7 @@ def read_technology_history(name: str) -> bytes:
     """Expose historical data for a technology from local DB/file as MCP resource.
     For now, returns a stub that looks into cache first and then the data directory.
     """
+    logger.info("resource access: history://technology/%s", name)
     # First try cache
     cached = cache.get(f"history:{name}")
     if cached is not None:
@@ -129,7 +140,7 @@ def read_technology_history(name: str) -> bytes:
 # Tools
 # -------------------------
 @server.tool()
-async def analyze_reddit(subreddits: List[str], lookback_days: int, keywords: List[str]) -> Dict[str, Any]:
+async def analyze_reddit(subreddits: List[str], lookback_days: int, keywords: List[str], ctx: Context = None) -> Dict[str, Any]:
     """Analyze Reddit for technology mentions and sentiment.
 
     Args:
@@ -140,7 +151,17 @@ async def analyze_reddit(subreddits: List[str], lookback_days: int, keywords: Li
     Returns:
       JSON with top technologies, mentions, and sentiment summary
     """
-    logger.info("analyze_reddit called | subreddits=%s lookback=%s days keywords=%s", subreddits, lookback_days, keywords)
+    start_ts = time.perf_counter()
+    client_id = getattr(ctx, "client_id", None) if ctx else None
+    request_id = getattr(ctx, "request_id", None) if ctx else None
+    logger.info(
+        "incoming request: analyze_reddit | client_id=%s request_id=%s | subreddits=%s lookback=%s days keywords=%s",
+        client_id,
+        request_id,
+        subreddits,
+        lookback_days,
+        keywords,
+    )
 
     # validate
     if not isinstance(subreddits, list) or not all(isinstance(s, str) for s in subreddits):
@@ -156,7 +177,7 @@ async def analyze_reddit(subreddits: List[str], lookback_days: int, keywords: Li
     analyzer = RedditAnalyzer(reddit_client=reddit_client, logger=logger, cache=cache)
 
     # caching key
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cache_key = f"reddit:{today}:{','.join(sorted(subreddits))}:{lookback_days}:{','.join(sorted([k.lower() for k in keywords]))}"
 
     async def fetch() -> Dict[str, Any]:
@@ -179,12 +200,20 @@ async def analyze_reddit(subreddits: List[str], lookback_days: int, keywords: Li
         return result
 
     result = await cache.get_or_fetch_async(cache_key, fetch, ttl=CONFIG.get("cache", {}).get("ttl", 3600))
-    logger.info("analyze_reddit finished | posts=%s unique_tech=%s", result.get("stats", {}).get("posts_analyzed"), result.get("stats", {}).get("unique_tech_count"))
+    elapsed = time.perf_counter() - start_ts
+    logger.info(
+        "analyze_reddit finished | client_id=%s request_id=%s | posts=%s unique_tech=%s | duration=%.3fs",
+        client_id,
+        request_id,
+        result.get("stats", {}).get("posts_analyzed"),
+        result.get("stats", {}).get("unique_tech_count"),
+        elapsed,
+    )
     return result
 
 
 @server.tool()
-async def generate_report(data: Dict[str, Any], format: str = "html", include_charts: bool = True) -> Dict[str, Any]:
+async def generate_report(data: Dict[str, Any], format: str = "html", include_charts: bool = True, ctx: Context = None) -> Dict[str, Any]:
     """Generate a report from analysis results.
 
     Args:
@@ -195,7 +224,16 @@ async def generate_report(data: Dict[str, Any], format: str = "html", include_ch
     Returns:
       JSON with path to generated report file
     """
-    logger.info("generate_report called | format=%s include_charts=%s", format, include_charts)
+    start_ts = time.perf_counter()
+    client_id = getattr(ctx, "client_id", None) if ctx else None
+    request_id = getattr(ctx, "request_id", None) if ctx else None
+    logger.info(
+        "incoming request: generate_report | client_id=%s request_id=%s | format=%s include_charts=%s",
+        client_id,
+        request_id,
+        format,
+        include_charts,
+    )
 
     if not isinstance(data, dict):
         raise ValueError("data must be a dict")
@@ -215,7 +253,14 @@ async def generate_report(data: Dict[str, Any], format: str = "html", include_ch
     else:
         out_path = await generator.generate_excel(data)
 
-    logger.info("generate_report finished | path=%s", out_path)
+    elapsed = time.perf_counter() - start_ts
+    logger.info(
+        "generate_report finished | client_id=%s request_id=%s | path=%s | duration=%.3fs",
+        client_id,
+        request_id,
+        out_path,
+        elapsed,
+    )
     return {"path": out_path}
 
 
@@ -238,13 +283,88 @@ async def get_historical_comparison(technology: str, days_back: int = 30) -> Dic
     return {"status": "not_implemented", "message": "Historical comparison will be added in a future version."}
 
 
+# -------------------------
+# HTTP Health Endpoint (optional)
+# -------------------------
+class HealthHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args) -> None:  # type: ignore[override]
+        try:
+            logger.debug("health_http | " + (format % args))
+        except Exception:
+            pass
+
+    def _write_json(self, code: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            # Ignore broken pipe on client disconnects
+            pass
+
+    def do_GET(self) -> None:  # type: ignore[override]
+        path = self.path.split("?", 1)[0]
+        if path in ("/health", "/healthz", "/ready", "/readiness"):
+            now = time.time()
+            uptime = max(0, now - START_TIME)
+            payload = {
+                "status": "ok",
+                "name": server_meta.get("name", "IT Trends MCP Server"),
+                "version": server_meta.get("version", "1.0.0"),
+                "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "uptime_seconds": round(uptime, 3),
+            }
+            self._write_json(200, payload)
+        else:
+            self._write_json(404, {"error": "not_found"})
+
+
+def start_http_health_server(host: str, port: int) -> Optional[Thread]:
+    if not port or port <= 0:
+        return None
+
+    def run_server() -> None:
+        try:
+            httpd = ThreadingHTTPServer((host, port), HealthHandler)
+            logger.info("Health HTTP server listening on http://%s:%s", host, port)
+            httpd.serve_forever(poll_interval=0.5)
+        except OSError as e:
+            logger.error("Failed to start health HTTP server on %s:%s: %s", host, port, e)
+        except Exception as e:
+            logger.exception("Health HTTP server crashed: %s", e)
+
+    t = Thread(target=run_server, name="health-http", daemon=True)
+    t.start()
+    return t
+
+
 if __name__ == "__main__":
+    # Optionally start lightweight HTTP health server
+    try:
+        srv_cfg = CONFIG.get("server", {})
+        http_host = srv_cfg.get("host", "127.0.0.1")
+        http_port = int(srv_cfg.get("port", 0) or 0)
+    except Exception:
+        http_host, http_port = "127.0.0.1", 0
+    if http_port:
+        start_http_health_server(http_host, http_port)
+
     # Log startup to stderr (safe for MCP stdio) so users see confirmation on launch
     try:
         pid = os.getpid()
     except Exception:
         pid = None
-    logger.info("MCP server successfully started | name=%s version=%s transport=stdio pid=%s", server_meta.get("name"), server_meta.get("version"), pid)
+    logger.info(
+        "MCP server successfully started | name=%s version=%s transport=stdio pid=%s health_http=%s:%s",
+        server_meta.get("name"),
+        server_meta.get("version"),
+        pid,
+        http_host,
+        http_port,
+    )
 
     # Run MCP server (stdio by default)
     server.run()
