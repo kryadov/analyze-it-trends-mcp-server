@@ -17,6 +17,8 @@ from mcp.server.fastmcp.server import Context
 # Local modules
 from tools.reddit_analyzer import RedditAnalyzer
 from tools.report_generator import ReportGenerator
+from tools.trends_searcher import TrendsSearcher
+from tools.freelance_analyzer import FreelanceAnalyzer
 from utils.cache_manager import CacheManager
 from utils.data_processor import DataProcessor
 from utils.api_clients import get_reddit_client
@@ -69,10 +71,10 @@ server_meta = CONFIG.get("server", {"name": "IT Trends MCP Server", "version": "
 # Optionally start lightweight HTTP health server
 try:
     srv_cfg = CONFIG.get("server", {})
-    http_host = srv_cfg.get("host", "127.0.0.1")
+    http_host = srv_cfg.get("host", "localhost")
     http_port = int(srv_cfg.get("port", 0) or 0)
 except Exception:
-    http_host, http_port = "127.0.0.1", 0
+    http_host, http_port = "localhost", 0
 
 # Log startup to stderr (safe for MCP stdio) so users see confirmation on launch
 try:
@@ -86,7 +88,7 @@ logger.info(
     pid
 )
 
-server = FastMCP(server_meta.get("name", "IT Trends MCP Server"), host=http_host, port=http_port)
+server = FastMCP(server_meta.get("name", "IT Trends MCP Server"), host=http_host, port=http_port, streamable_http_path="/")
 
 
 # -------------------------
@@ -276,17 +278,163 @@ async def generate_report(data: Dict[str, Any], format: str = "html", include_ch
     return {"path": out_path}
 
 
-# ---- Stubs for future tools (graceful degradation) ----
+# ---- Tools implemented for freelance and trends ----
 @server.tool()
-async def analyze_freelance(platforms: List[str], categories: Optional[List[str]] = None) -> Dict[str, Any]:
-    logger.warning("analyze_freelance called but not implemented yet")
-    return {"status": "not_implemented", "message": "Freelance analysis will be added in a future version."}
+async def analyze_freelance(platforms: List[str], categories: Optional[List[str]] = None, ctx: Context = None) -> Dict[str, Any]:
+    """Analyze freelance market demand from public sources (Upwork/Freelancer).
+
+    Args:
+      platforms: list including any of: upwork, freelancer, all
+      categories: optional keywords to filter results (best-effort)
+    """
+    start_ts = time.perf_counter()
+    client_id = getattr(ctx, "client_id", None) if ctx else None
+    request_id = getattr(ctx, "request_id", None) if ctx else None
+    logger.info(
+        "incoming request: analyze_freelance | client_id=%s request_id=%s | platforms=%s categories=%s",
+        client_id,
+        request_id,
+        platforms,
+        categories,
+    )
+
+    if not isinstance(platforms, list) or not all(isinstance(p, str) for p in platforms):
+        raise ValueError("platforms must be a list[str]")
+    categories_lc: Optional[List[str]] = None
+    if categories is not None:
+        if not isinstance(categories, list) or not all(isinstance(c, str) for c in categories):
+            raise ValueError("categories must be a list[str] if provided")
+        categories_lc = [c.strip().lower() for c in categories if isinstance(c, str) and c.strip()]
+
+    normalized = {p.strip().lower() for p in platforms if p and isinstance(p, str)}
+    if not normalized or "all" in normalized:
+        normalized = {"upwork", "freelancer"}
+    valid = {"upwork", "freelancer"}
+    chosen = sorted(list(normalized & valid))
+    if not chosen:
+        raise ValueError("platforms must include at least one of: upwork, freelancer, all")
+
+    # caching key (per-day)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cache_key = f"freelance:{today}:{','.join(chosen)}:{','.join(categories_lc or [])}"
+
+    async def fetch() -> Dict[str, Any]:
+        analyzer = FreelanceAnalyzer(logger=logger)
+        tasks = []
+        if "upwork" in chosen:
+            tasks.append(analyzer.scrape_upwork())
+        if "freelancer" in chosen:
+            tasks.append(analyzer.scrape_freelancer())
+        results = await asyncio.gather(*tasks) if tasks else []
+        jobs = []
+        for r in results:
+            jobs.extend(r or [])
+
+        # optional filtering by categories (keyword contains in title/skills)
+        if categories_lc:
+            def _match(job: Dict[str, Any]) -> bool:
+                text = (str(job.get("title") or "") + " " + str(job.get("description") or "")).lower()
+                skills = [str(s).lower() for s in (job.get("skills") or [])]
+                return any((kw in text) or any(kw in s for s in skills) for kw in categories_lc or [])
+            jobs = [j for j in jobs if _match(j)]
+
+        skills = await analyzer.parse_job_requirements(jobs)
+        avg_rate = await analyzer.calculate_avg_rates(jobs)
+        ranked = sorted(
+            ({"technology": k, "mentions": float(v)} for k, v in skills.items()),
+            key=lambda x: x["mentions"],
+            reverse=True,
+        )
+        status = "ok" if ranked else "not_available"
+        if ranked and avg_rate == 0.0:
+            status = "partial"
+        return {
+            "date": today,
+            "source": "freelance_markets",
+            "platforms": chosen,
+            "top_technologies": ranked,
+            "avg_hourly_rate": float(avg_rate),
+            "stats": {"jobs_count": len(jobs), "unique_skill_count": len(ranked)},
+            "status": status,
+        }
+
+    result = await cache.get_or_fetch_async(cache_key, fetch, ttl=CONFIG.get("cache", {}).get("ttl", 3600))
+    elapsed = time.perf_counter() - start_ts
+    logger.info(
+        "analyze_freelance finished | client_id=%s request_id=%s | platforms=%s jobs=%s skills=%s | duration=%.3fs",
+        client_id,
+        request_id,
+        ",".join(chosen),
+        result.get("stats", {}).get("jobs_count"),
+        result.get("stats", {}).get("unique_skill_count"),
+        elapsed,
+    )
+    return result
 
 
 @server.tool()
-async def search_trends(keywords: List[str], timeframe: str = "now 7-d", region: str = "US") -> Dict[str, Any]:
-    logger.warning("search_trends called but not implemented yet")
-    return {"status": "not_implemented", "message": "Trends search will be added in a future version."}
+async def search_trends(keywords: List[str], timeframe: str = "now 7-d", region: str = "US", ctx: Context = None) -> Dict[str, Any]:
+    """Search technology trends from multiple public sources (Google Trends, GitHub, StackOverflow).
+
+    Args:
+      keywords: list of keywords for Google Trends (optional; can be empty)
+      timeframe: timeframe hint (currently informational)
+      region: region hint (currently informational)
+    """
+    start_ts = time.perf_counter()
+    client_id = getattr(ctx, "client_id", None) if ctx else None
+    request_id = getattr(ctx, "request_id", None) if ctx else None
+    logger.info(
+        "incoming request: search_trends | client_id=%s request_id=%s | keywords=%s timeframe=%s region=%s",
+        client_id,
+        request_id,
+        keywords,
+        timeframe,
+        region,
+    )
+
+    if not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords):
+        raise ValueError("keywords must be a list[str]")
+    tf = str(timeframe or "now 7-d")
+    reg = str(region or "US")
+
+    # caching key (per-day)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    kw_norm = [k.strip().lower() for k in keywords if isinstance(k, str) and k.strip()]
+    cache_key = f"trends:{today}:{','.join(sorted(kw_norm))}:{tf}:{reg}"
+
+    async def fetch() -> Dict[str, Any]:
+        searcher = TrendsSearcher(logger=logger)
+        google, github, stackoverflow = await asyncio.gather(
+            searcher.search_google_trends(kw_norm),
+            searcher.search_github_trends(),
+            searcher.search_stackoverflow(),
+        )
+        combined = await searcher.aggregate_results([google, github, stackoverflow])
+        return {
+            "date": today,
+            "inputs": {"keywords": kw_norm, "timeframe": tf, "region": reg},
+            "sources": {
+                "google_trends": google,
+                "github_trending": github,
+                "stackoverflow": stackoverflow,
+            },
+            "top_technologies": combined.get("top_technologies", []),
+        }
+
+    result = await cache.get_or_fetch_async(cache_key, fetch, ttl=CONFIG.get("cache", {}).get("ttl", 3600))
+    elapsed = time.perf_counter() - start_ts
+    logger.info(
+        "search_trends finished | client_id=%s request_id=%s | keywords=%s unique_tech=%s | duration=%.3fs",
+        client_id,
+        request_id,
+        ",".join(kw_norm),
+        len(result.get("top_technologies", []) or []),
+        elapsed,
+    )
+    # also store per-day cache resource
+    cache.set(f"trends:{today}", result, ttl=CONFIG.get("cache", {}).get("ttl", 3600))
+    return result
 
 
 @server.tool()
