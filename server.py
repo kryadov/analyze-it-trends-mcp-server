@@ -6,22 +6,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from threading import Thread
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from dotenv import load_dotenv
 import yaml
 
-try:
-    # FastMCP is a high-level helper for building MCP servers easily
-    from mcp.server.fastmcp import FastMCP
-    from mcp.server.fastmcp.server import Context
-except Exception:  # pragma: no cover - fallback if fastmcp path changes
-    from mcp import FastMCP  # type: ignore
-    try:
-        from mcp.server.fastmcp.server import Context  # type: ignore
-    except Exception:  # pragma: no cover - last resort
-        Context = Any  # type: ignore
+from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import Context
 
 # Local modules
 from tools.reddit_analyzer import RedditAnalyzer
@@ -74,7 +65,28 @@ data_processor = DataProcessor(CONFIG.get("analysis", {}))
 # Init clients and analyzers lazily when used
 
 server_meta = CONFIG.get("server", {"name": "IT Trends MCP Server", "version": "1.0.0"})
-server = FastMCP(server_meta.get("name", "IT Trends MCP Server"))
+
+# Optionally start lightweight HTTP health server
+try:
+    srv_cfg = CONFIG.get("server", {})
+    http_host = srv_cfg.get("host", "127.0.0.1")
+    http_port = int(srv_cfg.get("port", 0) or 0)
+except Exception:
+    http_host, http_port = "127.0.0.1", 0
+
+# Log startup to stderr (safe for MCP stdio) so users see confirmation on launch
+try:
+    pid = os.getpid()
+except Exception:
+    pid = None
+logger.info(
+    "MCP server successfully started | name=%s version=%s transport=stdio pid=%s",
+    server_meta.get("name"),
+    server_meta.get("version"),
+    pid
+)
+
+server = FastMCP(server_meta.get("name", "IT Trends MCP Server"), host=http_host, port=http_port)
 
 
 # -------------------------
@@ -283,88 +295,7 @@ async def get_historical_comparison(technology: str, days_back: int = 30) -> Dic
     return {"status": "not_implemented", "message": "Historical comparison will be added in a future version."}
 
 
-# -------------------------
-# HTTP Health Endpoint (optional)
-# -------------------------
-class HealthHandler(BaseHTTPRequestHandler):
-    def log_message(self, format: str, *args) -> None:  # type: ignore[override]
-        try:
-            logger.debug("health_http | " + (format % args))
-        except Exception:
-            pass
-
-    def _write_json(self, code: int, payload: Dict[str, Any]) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except Exception:
-            # Ignore broken pipe on client disconnects
-            pass
-
-    def do_GET(self) -> None:  # type: ignore[override]
-        path = self.path.split("?", 1)[0]
-        if path in ("/health", "/healthz", "/ready", "/readiness"):
-            now = time.time()
-            uptime = max(0, now - START_TIME)
-            payload = {
-                "status": "ok",
-                "name": server_meta.get("name", "IT Trends MCP Server"),
-                "version": server_meta.get("version", "1.0.0"),
-                "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "uptime_seconds": round(uptime, 3),
-            }
-            self._write_json(200, payload)
-        else:
-            self._write_json(404, {"error": "not_found"})
-
-
-def start_http_health_server(host: str, port: int) -> Optional[Thread]:
-    if not port or port <= 0:
-        return None
-
-    def run_server() -> None:
-        try:
-            httpd = ThreadingHTTPServer((host, port), HealthHandler)
-            logger.info("Health HTTP server listening on http://%s:%s", host, port)
-            httpd.serve_forever(poll_interval=0.5)
-        except OSError as e:
-            logger.error("Failed to start health HTTP server on %s:%s: %s", host, port, e)
-        except Exception as e:
-            logger.exception("Health HTTP server crashed: %s", e)
-
-    t = Thread(target=run_server, name="health-http", daemon=True)
-    t.start()
-    return t
-
-
 if __name__ == "__main__":
-    # Optionally start lightweight HTTP health server
-    try:
-        srv_cfg = CONFIG.get("server", {})
-        http_host = srv_cfg.get("host", "127.0.0.1")
-        http_port = int(srv_cfg.get("port", 0) or 0)
-    except Exception:
-        http_host, http_port = "127.0.0.1", 0
-    if http_port:
-        start_http_health_server(http_host, http_port)
-
-    # Log startup to stderr (safe for MCP stdio) so users see confirmation on launch
-    try:
-        pid = os.getpid()
-    except Exception:
-        pid = None
-    logger.info(
-        "MCP server successfully started | name=%s version=%s transport=stdio pid=%s health_http=%s:%s",
-        server_meta.get("name"),
-        server_meta.get("version"),
-        pid,
-        http_host,
-        http_port,
-    )
 
     # Run MCP server (stdio by default)
-    server.run()
+    server.run(transport="streamable-http")
