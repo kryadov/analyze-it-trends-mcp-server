@@ -36,6 +36,42 @@ class ReportGenerator:
         )
         self.logger = logger
 
+    def _normalize_top_technologies(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return a normalized list of {technology, mentions}.
+
+        Accepts either:
+        - data["top_technologies"]: list of dicts with keys technology, mentions
+        - data["top_trends"]: list of strings; converted to dicts with rank-based mentions
+        """
+        items: List[Dict[str, Any]] = []
+        try:
+            raw = data.get("top_technologies")
+            if isinstance(raw, list) and raw:
+                # Already in the expected format
+                for it in raw:
+                    tech = str((it or {}).get("technology") or "").strip()
+                    if tech:
+                        items.append({
+                            "technology": tech,
+                            "mentions": float((it or {}).get("mentions", 0) or 0),
+                        })
+                return items
+
+            # Fallback: analyze_trends output provides list[str] in top_trends
+            trends = data.get("top_trends")
+            if isinstance(trends, list) and trends:
+                n = len(trends)
+                for idx, name in enumerate(trends):
+                    tech = str(name or "").strip()
+                    if tech:
+                        # Assign a simple descending score so charts look meaningful
+                        items.append({"technology": tech, "mentions": float(n - idx)})
+        except Exception as e:
+            # Be permissive; never break report generation on bad input
+            if hasattr(self, "logger") and self.logger:
+                self.logger.warning("Failed to normalize data for report: %s", e)
+        return items
+
     async def create_visualizations(self, data: Dict[str, Any]) -> Dict[str, str]:
         charts: Dict[str, str] = {}
         try:
@@ -43,7 +79,7 @@ class ReportGenerator:
                 self.logger.warning("matplotlib not available; skipping charts")
                 return charts
             # Example chart: top technologies by mentions
-            techs = data.get("top_technologies", [])
+            techs = self._normalize_top_technologies(data)
             if not techs:
                 return charts
             names = [t.get("technology") for t in techs[:15]]
@@ -84,7 +120,8 @@ class ReportGenerator:
         c.drawString(40, y, "Top Technologies:")
         y -= 20
         c.setFont("Helvetica", 10)
-        for item in (data.get("top_technologies") or [])[:25]:
+        items = self._normalize_top_technologies(data)[:25]
+        for item in items:
             line = f"- {item.get('technology')}: {item.get('mentions', 0)} mentions"
             c.drawString(50, y, line)
             y -= 14
@@ -109,7 +146,8 @@ class ReportGenerator:
         ws = wb.active
         ws.title = "Top Technologies"
         ws.append(["Technology", "Mentions"])
-        for item in data.get("top_technologies", []):
+        items = self._normalize_top_technologies(data)
+        for item in items:
             ws.append([item.get("technology"), item.get("mentions", 0)])
         out_path = self.output_dir / f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
         await asyncio.to_thread(wb.save, str(out_path))
@@ -117,9 +155,14 @@ class ReportGenerator:
 
     async def generate_html(self, data: Dict[str, Any], charts: Optional[Dict[str, str]] = None) -> str:
         template = self.env.get_template("report_template.html")
+        # Ensure template has top_technologies to render
+        items = self._normalize_top_technologies(data)
+        data_to_render = dict(data)
+        if items and not data_to_render.get("top_technologies"):
+            data_to_render["top_technologies"] = items
         html = template.render(
             generated_at=datetime.utcnow().isoformat() + "Z",
-            data=data,
+            data=data_to_render,
             charts=charts or {},
             title="IT Trends Report",
         )
