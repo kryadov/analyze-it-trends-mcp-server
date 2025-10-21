@@ -226,6 +226,8 @@ async def analyze_reddit(subreddits: List[str], lookback_days: int, keywords: Li
     return result
 
 
+@server.tool(name="report_generate")
+@server.tool(name="create_report")
 @server.tool()
 async def generate_report(data: Dict[str, Any], format: str = "html", include_charts: bool = True, ctx: Context = None) -> Dict[str, Any]:
     """Generate a report from analysis results.
@@ -275,7 +277,8 @@ async def generate_report(data: Dict[str, Any], format: str = "html", include_ch
         out_path,
         elapsed,
     )
-    return {"path": out_path}
+    # Return both keys for backward and forward compatibility
+    return {"file_path": out_path, "path": out_path}
 
 
 # ---- Tools implemented for freelance and trends ----
@@ -434,6 +437,99 @@ async def search_trends(keywords: List[str], timeframe: str = "now 7-d", region:
     )
     # also store per-day cache resource
     cache.set(f"trends:{today}", result, ttl=CONFIG.get("cache", {}).get("ttl", 3600))
+    return result
+
+
+@server.tool(name="analyze_trends")
+@server.tool(name="analyze")
+@server.tool(name="trends_analyze")
+async def analyze_trends(
+    days: int = 7,
+    sources: Optional[Dict[str, Any]] = None,
+    include_charts: bool = True,
+    language: str = "en",
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    """Aggregate multi-source IT trends into a unified view.
+
+    Input schema is aligned with the client expectations:
+      - days: lookback window (currently informational)
+      - sources: {"reddit": bool, "freelance": bool, "trends": bool}
+      - include_charts: passthrough for report generation (unused here)
+      - language: analysis language hint (unused here)
+
+    Returns a dict with keys: date, top_trends (list[str]), growth_leaders (list[str]), sources, summary.
+    """
+    start_ts = time.perf_counter()
+    client_id = getattr(ctx, "client_id", None) if ctx else None
+    request_id = getattr(ctx, "request_id", None) if ctx else None
+    logger.info(
+        "incoming request: analyze_trends | client_id=%s request_id=%s | days=%s sources=%s lang=%s",
+        client_id,
+        request_id,
+        days,
+        sources,
+        language,
+    )
+
+    # Validate inputs
+    if not isinstance(days, int) or days <= 0:
+        raise ValueError("days must be a positive int")
+    src = sources or {"reddit": True, "freelance": True, "trends": True}
+    if not isinstance(src, dict):
+        raise ValueError("sources must be a dict if provided")
+    use_trends = bool(src.get("trends", True))
+    # Note: reddit/freelance are currently hints; this tool focuses on trends aggregation for minimal latency.
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cache_key = f"analyze:{today}:{days}:{int(use_trends)}:{language}"
+
+    async def fetch() -> Dict[str, Any]:
+        searcher = TrendsSearcher(logger=logger)
+        google: Dict[str, Any] = {"top_technologies": []}
+        github: Dict[str, Any] = {"top_technologies": []}
+        stackoverflow: Dict[str, Any] = {"top_technologies": []}
+        combined: Dict[str, Any] = {"top_technologies": []}
+
+        if use_trends:
+            google, github, stackoverflow = await asyncio.gather(
+                searcher.search_google_trends([]),
+                searcher.search_github_trends(),
+                searcher.search_stackoverflow(),
+            )
+            combined = await searcher.aggregate_results([google, github, stackoverflow])
+
+        # Prepare outputs as simple string lists
+        top_n = int(CONFIG.get("analysis", {}).get("top_n_results", 20) or 20)
+        def _names(items: List[Dict[str, Any]]) -> List[str]:
+            return [str(i.get("technology") or "").strip() for i in items if str(i.get("technology") or "").strip()]
+
+        top_trends = _names(combined.get("top_technologies", [])[:top_n])
+        # Use GitHub trending as a proxy for fast growth leaders; fall back to top_trends
+        growth_leaders = _names(github.get("top_technologies", [])[:top_n]) or top_trends
+
+        summary = (
+            f"Aggregated technology signals from public sources for the last {days} days. "
+            f"Top {min(3, len(top_trends))}: {', '.join(top_trends[:3]) if top_trends else '—'}."
+        )
+
+        return {
+            "date": today,
+            "top_trends": top_trends,
+            "growth_leaders": growth_leaders,
+            "sources": {"reddit": bool(src.get("reddit", True)), "freelance": bool(src.get("freelance", True)), "trends": use_trends},
+            "summary": summary,
+        }
+
+    result = await cache.get_or_fetch_async(cache_key, fetch, ttl=CONFIG.get("cache", {}).get("ttl", 1800))
+    elapsed = time.perf_counter() - start_ts
+    logger.info(
+        "analyze_trends finished | client_id=%s request_id=%s | top_trends=%s | duration=%.3fs",
+        client_id,
+        request_id,
+        len(result.get("top_trends", []) or []),
+        elapsed,
+    )
     return result
 
 
