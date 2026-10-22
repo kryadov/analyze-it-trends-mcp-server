@@ -17,3 +17,6 @@ pydantic>=2.5.0
 python-dotenv>=1.0.0
 aiohttp>=3.9.0
 PyYAML>=6.0.1
+# eMudhra intermediate CA compromise (October 2026): certifi pulled in by the
+# HTTP client must be at least the release that drops those intermediates.
+certifi>=2026.10.19
